@@ -126,4 +126,4 @@ usb 1-1: can't set config #1, error -110
 
 ## 许可
 
-文档部分 CC BY 4.0，代码部分 MIT。
+[MIT](LICENSE) —— 文档和代码统一使用 MIT 许可，可自由使用、修改、分发。
