@@ -1,0 +1,3 @@
+# 桥接要独占串口，不要控制台日志来捣乱
+CONFIG_ESP_CONSOLE_NONE=y
+CONFIG_LOG_DEFAULT_LEVEL_NONE=y

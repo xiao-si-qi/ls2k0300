@@ -1,0 +1,62 @@
+# 凭据（不进仓库）
+SECRETS.local.md
+*.local.md
+
+# ===== 大体积二进制：内核 / 镜像 / 工具链 / 安装包 =====
+03-BSP/out/
+03-BSP/cross-toolchain/
+09-系统镜像/
+07-官方镜像/
+08-启动介质/
+
+# ===== 上游 clone 的仓库（作为独立项目维护，不纳入本仓库）=====
+03-BSP/build-2k0300/
+03-BSP/buildroot-2024.08/
+03-BSP/docs-2k0300/
+03-BSP/linux-6.12/
+03-BSP/u-boot/
+06-久久派官方资料/
+04-参考/Linux内核分析/
+04-参考/U-Boot源码解析/
+
+*.tar
+*.tar.gz
+*.tgz
+*.tar.xz
+*.tar.bz2
+*.xz
+*.zip
+*.7z
+
+# 内核与固件
+*.bin
+*.img
+*.uimg
+*.iso
+*.cpkg
+*.dtb
+*.ko
+
+# 文档 PDF（几十 MB，需要时从官方渠道下载）
+*.pdf
+
+# ===== 编译产物 =====
+03-BSP/src/switchyard-agent-go/switchyard-agent
+switchyard-agent
+openlist
+mihomo
+sing-box
+xray
+frpc
+frps
+*.exe
+*.o
+
+# ===== 杂项 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+__pycache__/
+.venv/
+node_modules/
