@@ -39,7 +39,23 @@ var (
 	deviceName = env("SY_DEVICE_NAME", "LS2K0300 板子")
 	model      = "Loongson 2K0300"
 	devType    = "host"
-	caps       = []string{"fw", "rssi", "uptime", "online"}
+	caps       = []string{"online", "reboot"}
+
+	// metrics 声明本设备上报的只读遥测。Switchyard 按这份清单生成 HA sensor，
+	// 不需要为每种指标改插件代码；caps 只留 Switchyard 要主动操作的能力。
+	metrics = []Metric{
+		{Key: "fw", Name: "固件", Icon: "mdi:chip"},
+		{Key: "rssi", Name: "信号", Unit: "dBm", Icon: "mdi:wifi", DeviceClass: "signal_strength"},
+		{Key: "uptime", Name: "运行时长", Unit: "s", Icon: "mdi:clock-outline",
+			DeviceClass: "duration", StateClass: "total_increasing"},
+		{Key: "ip_eth", Name: "有线 IP", Icon: "mdi:ethernet"},
+		{Key: "ip_wlan", Name: "无线 IP", Icon: "mdi:wifi"},
+		{Key: "cpu_load", Name: "CPU 占用", Unit: "%", Icon: "mdi:cpu-64-bit"},
+		{Key: "mem_used_pct", Name: "内存占用", Unit: "%", Icon: "mdi:memory"},
+		{Key: "disk_used_pct", Name: "存储占用", Unit: "%", Icon: "mdi:harddisk"},
+		{Key: "disk_free_mb", Name: "存储剩余", Unit: "MB", Icon: "mdi:database"},
+		{Key: "heap", Name: "可用内存", Unit: "KB", Icon: "mdi:memory"},
+	}
 
 	host = env("MQTT_HOST", "localhost")
 	port = envInt("MQTT_PORT", 1883)
@@ -87,7 +103,9 @@ type StatePayload struct {
 	ID         string   `json:"id"`
 	Type       string   `json:"type"`
 	FW         string   `json:"fw"`
-	IP         *string  `json:"ip"`
+	IP         *string  `json:"ip"`       // 主 IP（有线优先），Switchyard 台账用
+	IPEth      *string  `json:"ip_eth"`   // eth0 的 IPv4
+	IPWlan     *string  `json:"ip_wlan"`  // wlan0 的 IPv4
 	RSSI       *int     `json:"rssi"`
 	Uptime     int64    `json:"uptime"`
 	Heap       int64    `json:"heap"`
@@ -98,8 +116,19 @@ type StatePayload struct {
 	MemFreeKB  int64    `json:"mem_free_kb"`
 	MemUsedPct *float64 `json:"mem_used_pct"`
 	DiskFreeMB *int64   `json:"disk_free_mb"`
+	DiskUsedPct *float64 `json:"disk_used_pct"`
 	USB        bool     `json:"usb"`
 	Interval   int64    `json:"interval"`
+}
+
+type Metric struct {
+	Key         string `json:"key"`
+	Name        string `json:"name"`
+	Unit        string `json:"unit,omitempty"`
+	Icon        string `json:"icon,omitempty"`
+	DeviceClass string `json:"device_class,omitempty"`
+	StateClass  string `json:"state_class,omitempty"`
+	Object      string `json:"object,omitempty"`
 }
 
 type MetaPayload struct {
@@ -108,6 +137,7 @@ type MetaPayload struct {
 	Name     string   `json:"name"`
 	Model    string   `json:"model"`
 	Interval int64    `json:"interval"`
+	Metrics  []Metric `json:"metrics"`
 }
 
 type EventPayload struct {
@@ -257,26 +287,28 @@ func wlanRSSI() *int {
 
 var ipRe = regexp.MustCompile(`^\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)`)
 
-func primaryIP() *string {
+// ifaceIP 取指定前缀（eth / wlan）的第一块网卡的 IPv4。
+func ifaceIP(prefix string) *string {
 	out, err := exec.Command("ip", "-4", "-o", "addr", "show", "scope", "global").Output()
 	if err != nil {
 		return nil
 	}
-	var fallback *string
 	for _, line := range strings.Split(string(out), "\n") {
 		m := ipRe.FindStringSubmatch(line)
-		if m == nil {
-			continue
-		}
-		addr := m[2]
-		if strings.HasPrefix(m[1], "eth") {
+		if m != nil && strings.HasPrefix(m[1], prefix) {
+			addr := m[2]
 			return &addr
 		}
-		if fallback == nil {
-			fallback = &addr
-		}
 	}
-	return fallback
+	return nil
+}
+
+// primaryIP 返回对外展示的主 IP：有线优先，没有有线才用无线。
+func primaryIP() *string {
+	if ip := ifaceIP("eth"); ip != nil {
+		return ip
+	}
+	return ifaceIP("wlan")
 }
 
 func memInfo() (totalKB, availKB int64) {
@@ -296,13 +328,23 @@ func memInfo() (totalKB, availKB int64) {
 	return
 }
 
-func diskFreeMB() *int64 {
+// diskUsage 返回根文件系统剩余 MB 和已用百分比。
+func diskUsage() (freeMB *int64, usedPct *float64) {
 	var st syscall.Statfs_t
 	if err := syscall.Statfs("/", &st); err != nil {
-		return nil
+		return nil, nil
 	}
-	v := int64(st.Bavail) * int64(st.Frsize) / 1048576
-	return &v
+	frsize := float64(st.Frsize)
+	total := float64(st.Blocks) * frsize
+	free := float64(st.Bavail) * frsize
+	f := int64(free / 1048576)
+	freeMB = &f
+	if total > 0 {
+		p := (total - free) / total * 100
+		p = float64(int(p*10)) / 10
+		usedPct = &p
+	}
+	return freeMB, usedPct
 }
 
 func usbPresent() bool {
@@ -322,22 +364,26 @@ func buildState() StatePayload {
 	if v, ok := cpuLoad.Load().(float64); ok {
 		load = &v
 	}
+	freeMB, diskPct := diskUsage()
 	return StatePayload{
-		ID:         deviceID,
-		Type:       devType,
-		FW:         kernelVersion(),
-		IP:         primaryIP(),
-		RSSI:       wlanRSSI(),
-		Uptime:     uptimeSeconds(),
-		Heap:       availKB,
-		TS:         time.Now().Unix(),
-		CPULoad:    load,
-		MemTotalKB: totalKB,
-		MemFreeKB:  availKB,
-		MemUsedPct: usedPct,
-		DiskFreeMB: diskFreeMB(),
-		USB:        usbPresent(),
-		Interval:   interval.Load(),
+		ID:          deviceID,
+		Type:        devType,
+		FW:          kernelVersion(),
+		IP:          primaryIP(),
+		IPEth:       ifaceIP("eth"),
+		IPWlan:      ifaceIP("wlan"),
+		RSSI:        wlanRSSI(),
+		Uptime:      uptimeSeconds(),
+		Heap:        availKB,
+		TS:          time.Now().Unix(),
+		CPULoad:     load,
+		MemTotalKB:  totalKB,
+		MemFreeKB:   availKB,
+		MemUsedPct:  usedPct,
+		DiskFreeMB:  freeMB,
+		DiskUsedPct: diskPct,
+		USB:         usbPresent(),
+		Interval:    interval.Load(),
 	}
 }
 
@@ -348,6 +394,7 @@ func buildMeta() MetaPayload {
 		Name:     deviceName,
 		Model:    model,
 		Interval: interval.Load(),
+		Metrics:  metrics,
 	}
 }
 
@@ -418,6 +465,20 @@ func publishLog() bool {
 func publishAck(seq int64, ok bool, errMsg string) bool {
 	return publish(tAck, AckPayload{Seq: seq, OK: ok, Err: errMsg}, false)
 }
+
+// ---------------------------------------------------------------- 只读监控实体
+//
+// 设计原则（与 Switchyard 的分工）：
+//
+//	caps 只放「Switchyard 需要主动操作、HA 自己做不到」的能力——
+//	本设备支持 reboot，所以就一个 caps: ["online", "reboot"]（online 走 LWT，特殊）。
+//
+//	纯只读的遥测（IP / CPU / 内存 / 磁盘 / 信号 / 运行时长）不进 caps，
+//	而是写进 meta.metrics 由 Switchyard 统一生成 HA sensor：
+//	设备只声明"我有哪些值、叫什么、单位是什么"，不需要懂 HA 的 discovery 格式，
+//	Switchyard 的 SPECS 词表也不会为每台新设备扩张。
+//
+//	加新指标只需要在 metrics 里加一行 + state 里补一个字段，插件不用动。
 
 // ---------------------------------------------------------------- 持久化
 
