@@ -39,10 +39,15 @@ var (
 	deviceName = env("SY_DEVICE_NAME", "LS2K0300 板子")
 	model      = "Loongson 2K0300"
 	devType    = "host"
-	caps       = []string{"online", "reboot"}
 
-	// metrics 声明本设备上报的只读遥测。Switchyard 按这份清单生成 HA sensor，
-	// 不需要为每种指标改插件代码；caps 只留 Switchyard 要主动操作的能力。
+	// caps：只放「必须由 Switchyard 操作、HA 做不到」的能力。
+	// 本板没有 OTA / 布局下发，所以是空表——重启这类 HA 能表达的动作
+	// 走设备自己的 HA Discovery，不占 caps。
+	caps = []string{}
+
+	// metrics：只读遥测。用于两件事：
+	//   1. 设备自己发布 HA Discovery（HA 直接拿到实体，不经过 Switchyard）
+	//   2. 写进 meta 供 Switchyard 界面展示（台账）
 	metrics = []Metric{
 		{Key: "fw", Name: "固件", Icon: "mdi:chip"},
 		{Key: "rssi", Name: "信号", Unit: "dBm", Icon: "mdi:wifi", DeviceClass: "signal_strength"},
@@ -124,6 +129,7 @@ type StatePayload struct {
 type Metric struct {
 	Key         string `json:"key"`
 	Name        string `json:"name"`
+	Kind        string `json:"kind,omitempty"` // 空 = sensor；binary_sensor 表示布尔
 	Unit        string `json:"unit,omitempty"`
 	Icon        string `json:"icon,omitempty"`
 	DeviceClass string `json:"device_class,omitempty"`
@@ -131,13 +137,20 @@ type Metric struct {
 	Object      string `json:"object,omitempty"`
 }
 
+// HAEntity 记录本设备往 HA 发过哪些实体，供 Switchyard 的「删除设备」照着清。
+type HAEntity struct {
+	Component string `json:"component"`
+	Object    string `json:"object"`
+}
+
 type MetaPayload struct {
-	Type     string   `json:"type"`
-	Caps     []string `json:"caps"`
-	Name     string   `json:"name"`
-	Model    string   `json:"model"`
-	Interval int64    `json:"interval"`
-	Metrics  []Metric `json:"metrics"`
+	Type       string     `json:"type"`
+	Caps       []string   `json:"caps"`
+	Name       string     `json:"name"`
+	Model      string     `json:"model"`
+	Interval   int64      `json:"interval"`
+	Metrics    []Metric   `json:"metrics"`
+	HAEntities []HAEntity `json:"ha_entities"`
 }
 
 type EventPayload struct {
@@ -389,12 +402,13 @@ func buildState() StatePayload {
 
 func buildMeta() MetaPayload {
 	return MetaPayload{
-		Type:     devType,
-		Caps:     caps,
-		Name:     deviceName,
-		Model:    model,
-		Interval: interval.Load(),
-		Metrics:  metrics,
+		Type:       devType,
+		Caps:       caps,
+		Name:       deviceName,
+		Model:      model,
+		Interval:   interval.Load(),
+		Metrics:    metrics,
+		HAEntities: buildHAEntities(),
 	}
 }
 
@@ -466,19 +480,162 @@ func publishAck(seq int64, ok bool, errMsg string) bool {
 	return publish(tAck, AckPayload{Seq: seq, OK: ok, Err: errMsg}, false)
 }
 
-// ---------------------------------------------------------------- 只读监控实体
+// ---------------------------------------------------------------- HA Discovery
 //
-// 设计原则（与 Switchyard 的分工）：
+// 分界线（v0.3 起）：
 //
-//	caps 只放「Switchyard 需要主动操作、HA 自己做不到」的能力——
-//	本设备支持 reboot，所以就一个 caps: ["online", "reboot"]（online 走 LWT，特殊）。
+//	HA 能直接表达的（传感器/开关/按钮/数字）→ 设备自己发布 HA MQTT Discovery。
+//	  这样实体不经过 Switchyard，插件挂了/升级坏了，HA 的实体和自动化都不受影响。
 //
-//	纯只读的遥测（IP / CPU / 内存 / 磁盘 / 信号 / 运行时长）不进 caps，
-//	而是写进 meta.metrics 由 Switchyard 统一生成 HA sensor：
-//	设备只声明"我有哪些值、叫什么、单位是什么"，不需要懂 HA 的 discovery 格式，
-//	Switchyard 的 SPECS 词表也不会为每台新设备扩张。
+//	只有 Switchyard 才能做的（OTA 分发、布局下发、批量配置）→ switchyard/<id>/cmd。
 //
-//	加新指标只需要在 metrics 里加一行 + state 里补一个字段，插件不用动。
+// 状态主题仍用 switchyard/<id>/state：它是数据源，HA 和 Switchyard 都读它，
+// 但都只是"读"，谁挂了都不影响对方。
+//
+// 本设备的 HA 实体：
+//	  10 个 metrics  → sensor
+//	  在线状态       → binary_sensor（读 availability）
+//	  重启           → button（HA 下发到 switchyard/<id>/ha/reboot/set）
+
+const haPrefix = "homeassistant"
+
+func haCmdTopic(obj string) string {
+	return "switchyard/" + deviceID + "/ha/" + obj + "/set"
+}
+
+func haConfigTopic(component, obj string) string {
+	return fmt.Sprintf("%s/%s/switchyard_%s/%s/config", haPrefix, component, deviceID, obj)
+}
+
+func haDeviceBlock() map[string]any {
+	return map[string]any{
+		"identifiers":  []string{"switchyard_" + deviceID},
+		"name":         deviceName,
+		"manufacturer": "Switchyard",
+		"model":        model,
+		"sw_version":   kernelVersion(),
+	}
+}
+
+// buildHAEntities 列出本设备往 HA 发布过哪些实体（供 Switchyard 删除设备时清理）。
+func buildHAEntities() []HAEntity {
+	out := make([]HAEntity, 0, len(metrics)+2)
+	for _, m := range metrics {
+		comp := "sensor"
+		if m.Kind == "binary_sensor" {
+			comp = "binary_sensor"
+		}
+		out = append(out, HAEntity{Component: comp, Object: metricObject(m)})
+	}
+	out = append(out,
+		HAEntity{Component: "binary_sensor", Object: "online"},
+		HAEntity{Component: "button", Object: "reboot"},
+	)
+	return out
+}
+
+func metricObject(m Metric) string {
+	if m.Object != "" {
+		return m.Object
+	}
+	return m.Key
+}
+
+// publishHADiscovery 发布全部实体配置（retained）。连接建立时调用一次即可，
+// broker 会一直保留；重连补发是为了应对 broker 丢 retained 的情况。
+func publishHADiscovery() {
+	dev := haDeviceBlock()
+	origin := map[string]any{"name": "switchyard-agent"}
+	n := 0
+
+	for _, m := range metrics {
+		obj := metricObject(m)
+		kind := m.Kind
+		if kind == "" {
+			kind = "sensor"
+		}
+		cfg := map[string]any{
+			"name":            m.Name,
+			"unique_id":       "switchyard_" + deviceID + "_" + obj,
+			"object_id":       deviceID + "_" + obj,
+			"state_topic":     tState,
+			"device":          dev,
+			"origin":          origin,
+			"entity_category": "diagnostic",
+		}
+		if kind == "binary_sensor" {
+			cfg["value_template"] = fmt.Sprintf("{{ 'ON' if value_json.%s else 'OFF' }}", m.Key)
+			cfg["payload_on"] = "ON"
+			cfg["payload_off"] = "OFF"
+		} else {
+			cfg["value_template"] = fmt.Sprintf("{{ value_json.%s }}", m.Key)
+			if m.Unit != "" {
+				cfg["unit_of_measurement"] = m.Unit
+				sc := m.StateClass
+				if sc == "" {
+					sc = "measurement"
+				}
+				cfg["state_class"] = sc
+			}
+		}
+		if m.Icon != "" {
+			cfg["icon"] = m.Icon
+		}
+		if m.DeviceClass != "" {
+			cfg["device_class"] = m.DeviceClass
+		}
+		if publish(haConfigTopic(kind, obj), cfg, true) {
+			n++
+		}
+	}
+
+	// 在线状态：读 availability（LWT 维护）
+	online := map[string]any{
+		"name":         "在线",
+		"unique_id":    "switchyard_" + deviceID + "_online",
+		"object_id":    deviceID + "_online",
+		"state_topic":  tAvail,
+		"payload_on":   "online",
+		"payload_off":  "offline",
+		"device_class": "connectivity",
+		"device":       dev,
+		"origin":       origin,
+	}
+	if publish(haConfigTopic("binary_sensor", "online"), online, true) {
+		n++
+	}
+
+	// 重启按钮：HA 点一下 → 发到 ha/reboot/set
+	reboot := map[string]any{
+		"name":          "重启",
+		"unique_id":     "switchyard_" + deviceID + "_reboot",
+		"object_id":     deviceID + "_reboot",
+		"command_topic": haCmdTopic("reboot"),
+		"payload_press": "PRESS",
+		"icon":          "mdi:restart",
+		"device":        dev,
+		"origin":        origin,
+	}
+	if publish(haConfigTopic("button", "reboot"), reboot, true) {
+		n++
+	}
+
+	logf("[discovery] 发布 %d 个 HA 实体（不经过 Switchyard）", n)
+}
+
+// handleHACmd 处理 HA 侧下发的控制命令（主题 switchyard/<id>/ha/<obj>/set）。
+func handleHACmd(obj string, payload []byte) {
+	body := strings.TrimSpace(string(payload))
+	logf("[ha-cmd] %s = %q", obj, body)
+	switch obj {
+	case "reboot":
+		logf("[ha-cmd] 执行重启")
+		time.Sleep(300 * time.Millisecond)
+		_ = exec.Command("reboot").Start()
+	default:
+		logf("[ha-cmd] 未知对象: %s", obj)
+	}
+}
 
 // ---------------------------------------------------------------- 持久化
 
@@ -653,8 +810,14 @@ func main() {
 		publishMeta()
 		publish(tAvail, "online", true)
 		publishState()
+		publishHADiscovery() // 实体由设备自己注册，不经过 Switchyard
 		c.SubscribeMultiple(
-			map[string]byte{tCmd: 1, tCfg: 1},
+			map[string]byte{
+				tCmd: 1,
+				tCfg: 1,
+				// HA 下发的控制命令（button/number/switch 的 command_topic）
+				"switchyard/" + deviceID + "/ha/+/set": 1,
+			},
 			func(_ mqtt.Client, m mqtt.Message) {
 				defer func() {
 					if r := recover(); r != nil {
@@ -662,10 +825,17 @@ func main() {
 						publishDiag(fmt.Sprintf("处理消息出错: %v", r))
 					}
 				}()
-				if m.Topic() == tCmd {
+				switch {
+				case m.Topic() == tCmd:
 					handleCmd(m)
-				} else {
+				case m.Topic() == tCfg:
 					handleCfg(m)
+				default:
+					// switchyard/<id>/ha/<obj>/set
+					parts := strings.Split(m.Topic(), "/")
+					if len(parts) == 5 && parts[0] == "switchyard" && parts[2] == "ha" && parts[4] == "set" {
+						handleHACmd(parts[3], m.Payload())
+					}
 				}
 			})
 		publishEvent("boot", "fw", kernelVersion())
@@ -691,6 +861,18 @@ func main() {
 			if time.Since(last) >= time.Duration(interval.Load())*time.Second {
 				last = time.Now()
 				publishState()
+			}
+		}
+	}()
+
+	// 定期重发 HA discovery（retained）。
+	// 保险起见：broker 丢过 retained、或者别的组件误清了配置时，设备能自己补回来，
+	// 不需要人去 HA 里点"重新加载"。12 条 retained 消息，开销可忽略。
+	go func() {
+		for {
+			time.Sleep(10 * time.Minute)
+			if client != nil && client.IsConnectionOpen() {
+				publishHADiscovery()
 			}
 		}
 	}()
