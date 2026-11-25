@@ -17,8 +17,11 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"regexp"
@@ -50,16 +53,17 @@ var (
 	//   2. 写进 meta 供 Switchyard 界面展示（台账）
 	metrics = []Metric{
 		{Key: "fw", Name: "固件", Icon: "mdi:chip"},
-		{Key: "rssi", Name: "信号", Unit: "dBm", Icon: "mdi:wifi", DeviceClass: "signal_strength"},
+		{Key: "rssi", Name: "信号", Unit: "dBm", Icon: "mdi:wifi", DeviceClass: "signal_strength",
+			Precision: iptr(0)},
 		{Key: "uptime", Name: "运行时长", Unit: "s", Icon: "mdi:clock-outline",
-			DeviceClass: "duration", StateClass: "total_increasing"},
+			DeviceClass: "duration", StateClass: "total_increasing", Precision: iptr(0)},
 		{Key: "ip_eth", Name: "有线 IP", Icon: "mdi:ethernet"},
 		{Key: "ip_wlan", Name: "无线 IP", Icon: "mdi:wifi"},
-		{Key: "cpu_load", Name: "CPU 占用", Unit: "%", Icon: "mdi:cpu-64-bit"},
-		{Key: "mem_used_pct", Name: "内存占用", Unit: "%", Icon: "mdi:memory"},
-		{Key: "disk_used_pct", Name: "存储占用", Unit: "%", Icon: "mdi:harddisk"},
-		{Key: "disk_free_mb", Name: "存储剩余", Unit: "MB", Icon: "mdi:database"},
-		{Key: "heap", Name: "可用内存", Unit: "KB", Icon: "mdi:memory"},
+		{Key: "cpu_load", Name: "CPU 占用", Unit: "%", Icon: "mdi:cpu-64-bit", Precision: iptr(1)},
+		{Key: "mem_used_pct", Name: "内存占用", Unit: "%", Icon: "mdi:memory", Precision: iptr(1)},
+		{Key: "disk_used_pct", Name: "存储占用", Unit: "%", Icon: "mdi:harddisk", Precision: iptr(1)},
+		{Key: "disk_free_mb", Name: "存储剩余", Unit: "MB", Icon: "mdi:database", Precision: iptr(0)},
+		{Key: "heap", Name: "可用内存", Unit: "KB", Icon: "mdi:memory", Precision: iptr(0)},
 	}
 
 	host = env("MQTT_HOST", "localhost")
@@ -135,7 +139,10 @@ type Metric struct {
 	DeviceClass string `json:"device_class,omitempty"`
 	StateClass  string `json:"state_class,omitempty"`
 	Object      string `json:"object,omitempty"`
+	Precision   *int   `json:"precision,omitempty"` // HA 的 suggested_display_precision
 }
+
+func iptr(n int) *int { return &n }
 
 // HAEntity 记录本设备往 HA 发过哪些实体，供 Switchyard 的「删除设备」照着清。
 type HAEntity struct {
@@ -262,7 +269,8 @@ func procStat() (total, idle uint64, ok bool) {
 	return sum, idle, true
 }
 
-// cpuSampler 每秒采一次 /proc/stat，算 CPU 占用率（和 Python 版行为一致）。
+// cpuSampler 每秒采一次 /proc/stat，算 CPU 占用率。
+// 结果保留 1 位小数：/proc/stat 的计数器是整数，直接除会得到 10.1010101… 这种玩意。
 func cpuSampler() {
 	for {
 		t1, i1, ok1 := procStat()
@@ -277,6 +285,10 @@ func cpuSampler() {
 		if pct < 0 {
 			pct = 0
 		}
+		if pct > 100 {
+			pct = 100 // 计数器偶有跨核累加误差，钳一下
+		}
+		pct = math.Round(pct*10) / 10
 		cpuLoad.Store(pct)
 		time.Sleep(9 * time.Second)
 	}
@@ -584,6 +596,10 @@ func publishHADiscovery() {
 		if m.DeviceClass != "" {
 			cfg["device_class"] = m.DeviceClass
 		}
+		if m.Precision != nil {
+			// HA 面板按这个精度显示，避免 10.1010101… 这种值直接怼到界面上
+			cfg["suggested_display_precision"] = *m.Precision
+		}
 		if publish(haConfigTopic(kind, obj), cfg, true) {
 			n++
 		}
@@ -783,6 +799,46 @@ func handleCfg(msg mqtt.Message) {
 	publishEvent("cfg_applied")
 }
 
+// mqttEndpoint 按配置决定明文还是 TLS，返回 broker URL 和 TLS 配置。
+//
+// 明文时 broker 在同一个局域网（路由器已做了 DNS/NAT 处理）就够了；
+// 一旦 broker 在公网，凭据和命令全程明文，必须开 TLS。
+//
+//	MQTT_TLS=1            启用 TLS（默认 0 = 明文）
+//	MQTT_CA_FILE=路径     自定义 CA（企业内网/自签证书）；留空用系统根证书
+//	MQTT_INSECURE=1       跳过证书与主机名校验，**仅调试用**
+//	MQTT_SERVER_NAME=xxx  覆盖 SNI / 证书校验用的主机名，默认用 MQTT_HOST
+func mqttEndpoint() (string, *tls.Config, error) {
+	if envInt("MQTT_TLS", 0) != 1 {
+		return fmt.Sprintf("tcp://%s:%d", host, port), nil, nil
+	}
+
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: env("MQTT_SERVER_NAME", host),
+	}
+
+	if caFile := env("MQTT_CA_FILE", ""); caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return "", nil, fmt.Errorf("读取 CA 文件失败: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return "", nil, fmt.Errorf("CA 文件里没有可用的证书: %s", caFile)
+		}
+		tlsCfg.RootCAs = pool
+	}
+
+	if envInt("MQTT_INSECURE", 0) == 1 {
+		tlsCfg.InsecureSkipVerify = true
+		logf("[mqtt] ⚠ 已禁用证书校验（MQTT_INSECURE=1），仅限调试")
+	}
+
+	// paho 认 ssl:// 作为 TLS 传输
+	return fmt.Sprintf("ssl://%s:%d", host, port), tlsCfg, nil
+}
+
 // ---------------------------------------------------------------- 主流程
 
 func main() {
@@ -792,8 +848,21 @@ func main() {
 
 	go cpuSampler()
 
+	brokerURL, tlsCfg, err := mqttEndpoint()
+	if err != nil {
+		logf("[fatal] %v", err)
+		os.Exit(1)
+	}
+
 	opts := mqtt.NewClientOptions()
-	opts.AddBroker(fmt.Sprintf("tcp://%s:%d", host, port))
+	opts.AddBroker(brokerURL)
+	if tlsCfg != nil {
+		opts.SetTLSConfig(tlsCfg)
+		logf("[mqtt] 使用 TLS 连接 %s（CA=%s，SNI=%s）",
+			brokerURL, env("MQTT_CA_FILE", "系统根证书"), tlsCfg.ServerName)
+	} else {
+		logf("[mqtt] 使用明文连接 %s", brokerURL)
+	}
 	opts.SetClientID("switchyard-" + deviceID)
 	opts.SetUsername(user)
 	opts.SetPassword(pass)
